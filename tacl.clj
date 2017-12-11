@@ -1,6 +1,5 @@
-(ns clibtrader.talib
+(ns tacl.tacl
   (:gen-class)
-  (:require [clibtrader.csvjson :as csvjson])
   )
 
 ;these functions provide technical indicators for price series
@@ -8,39 +7,45 @@
 ;input conventions: p is period
 
 
-
-;Test vectors
-(def v0 (vec (take 300 (repeatedly #(rand-int 100)))))
-(def v1 (csvjson/vecFromMap (csvjson/readCSV "XXX/v1.csv") :price))
-(def v2 (csvjson/vecFromMap (csvjson/readCSV "XXX/v2.csv") :price))
-(def v1s (csvjson/colFromMap (csvjson/readCSV "XXX/v1.csv") :price))
-(def v2s (csvjson/colFromMap (csvjson/readCSV "XXX/v2.csv") :price))
-
-
 ;Simple rolling functions - data will come as nil if not perfectly formed
-
-(defn generic_rolling [fc c p]
+;this is not fast enough for long periods
+(defn generic_rolling_fixed_width [fc c p]
 	(lazy-cat
 		(repeat (- p 1) nil)
-		(map fc (partition p 1 c))
-	)
-)
+		(map fc (partition p 1 c))))
 
-(defmulti rolling (fn [f c p] f))
-(defmethod rolling :mean [f c p]
-	(generic_rolling (fn [a] (/ (reduce + a) (float p))) c p))
-(defmethod rolling :max [f c p]
-	(generic_rolling (fn [a] (apply max a)) c p))
-(defmethod rolling :min [f c p]
-	(generic_rolling (fn [a] (apply min a)) c p))
+(defn generic_rolling [fc c p]
+	(map fc (partition p 1 c)))
 
-; (defmethod rolling :mean [f c p]
-; 	(generic_rolling (fn [a] (/ (reduce + a) (float (count a)))) c p)
-; )
+
+;Fast moving average
+(defn moving_average
+  "Calculates the moving average of values with the given period.
+  Returns a lazy seq, works with infinite input sequences.
+  Does not include initial zeros in the output."
+  [values period]
+  (letfn [(gen [last-sum values-old values-new]
+              (if (empty? values-new)
+                nil
+                (let [num-out (first values-old)
+                      num-in  (first values-new)
+                      new-sum (+ last-sum (- num-out) num-in)]
+                  (lazy-seq
+                    (cons new-sum
+                          (gen new-sum
+                               (next values-old)
+                               (next values-new)))))))]
+    (if (< (count (take period values)) period)
+      nil
+      (map #(/ % period)
+           (gen (apply + (take (dec period) values))
+                (cons 0 values)
+                (drop (dec period) values))))))
+
+
 
 ;Exponential moving average
-
-;pandas adjust=False. In practice convergence very fast to adjust=True
+;python pandas adjust=False. In practice convergence very fast to adjust=True
 (defn ema [c ^double a]
   (let [a' (- 1 a)]
     (reductions
@@ -55,45 +60,105 @@
 (defmethod ewm :span [f c p] (ema c (/ 2 (+ p 1))))
 
 
+;Basic point arithmetic
+(defn +s [v1 v2] (map + v1 v2))
+(defn -s [v1 v2] (map - v1 v2))
+(defn *s [v1 v2] (map * v1 v2))
+(defn divssafe [v1 v2] (map (fn [a b] (if (zero? b) nil (/ a b))) v1 v2))
 
-(defn addv [v1 v2]
-  (map + v1 v2)
-  )
+;Delta functions
+(defn ds [v] (-s (rest v) (drop-last v)))
+(defn dvv [v] (conj (ds v) nil)) ; append at beginning of sequence
+(defn dss [v] (conj [nil] (ds v))) ; append at beginning of vector
 
-(defn diffv [v1 v2]
-  (map - v1 v2)
-  )
+;wrong
+; (defn dsn [v n]
+;   (-s (take-last v n) (drop-last v n))
+;   )
 
-(defn divvsafe [v1 v2]
-  (map (fn [a b] (if (zero? b) nil (/ a b))) v1 v2)
-  )
-
-(defn dvl [v]
-  (conj [nil] (diffv (rest v) (drop-last v)))
-  )
-
-(defn dv [v]
-  (diffv (rest v) (drop-last v))
-  )
 
 ;Relative strength index - data will come as nil if not perfectly formed
-(defn rsiv [v p]
-  (let [d (dv v)
-        u (mapv (fn [x] (if (pos? x) x 0)) d)
-        d (mapv (fn [x] (if (neg? x) (- x) 0)) d)
-        uede (divvsafe (ewm :span u p) (ewm :span d p))
-        ]
-    (mapv (fn [x] (if (zero? x) nil (- 100 (/ 1 (+ 1 x))))) uede)
-    )
-  )
-
-;Relative strength index - data will come as nil if not perfectly formed
-(defn rsi [v p]
-  (let [d (dv v)
+;matches talib perfectly. Note definition of alpha matching neither com nor span
+(defn rsi [c p]
+  (let [d (ds c)
         u (map (fn [x] (if (pos? x) x 0)) d)
         d (map (fn [x] (if (neg? x) (- x) 0)) d)
-        uede (divvsafe (ewm :span u p) (ewm :span d p))
-        ]
-    (map (fn [x] (if (nil? x) nil (- 100 (/ 100 (+ 1 x))))) uede)
-    )
-  )
+        uede (divssafe (ewm :alpha u (/ 1. p)) (ewm :alpha d (/ 1. p)))]
+    (map (fn [x] (if (nil? x) nil (- 100 (/ 100 (+ 1 x))))) uede)))
+
+
+(defn rsi_legacy [c p]
+	;this is the wrong implementation
+	;but it matches what I backtested in Python
+  (let [d (ds c)
+        u (map (fn [x] (if (pos? x) x 0)) d)
+        d (map (fn [x] (if (neg? x) (- x) 0)) d)
+        uede (divssafe (ewm :span u p) (ewm :span d p))]
+    (map (fn [x] (if (nil? x) nil (- 100 (/ 100 (+ 1 x))))) uede)))
+
+;;;;;;;;;;;;;;;;
+
+;this will only be faster for (realistic) cases where there are trends
+(defn max2 [c p]
+    (letfn [(f [sq priormax]
+              (if (empty? sq)
+                  ()
+                  (let [w (first sq) lw (last w) nm (if (> lw priormax) lw (apply max w))]
+                    (lazy-seq (cons nm (f (next sq) nm))))))]
+    (f (partition p 1 c) -1000)))
+
+;Fast algorithms
+(defn ascending_minima [c p]
+	(let [window (java.util.ArrayDeque. p) n (count c) out (atom []) i (atom 0)]
+		(while (< @i n)
+			(let [ci (nth c @i)]
+				(while
+					(and
+						(not (zero? (.size window)))
+						(>= (first (.peekFirst window)) ci))
+					(.removeFirst window)
+				)	
+				(.addFirst window [ci @i])
+				(while (<= (last (.peekLast window)) (- @i p))
+					(.removeLast window)
+				)
+				(swap! out (fn [x] (conj x (first (.peekLast window)))))
+			(swap! i inc)
+			)
+		)
+		@out
+	)
+)
+
+(defn ascending_maxima [c p]
+	(let [window (java.util.ArrayDeque. p) n (count c) out (atom []) i (atom 0)]
+		(while (< @i n)
+			(let [ci (nth c @i)]
+				(while
+					(and
+						(not (zero? (.size window)))
+						(<= (first (.peekFirst window)) ci))
+					(.removeFirst window)
+				)	
+				(.addFirst window [ci @i])
+				(while (<= (last (.peekLast window)) (- @i p))
+					(.removeLast window)
+				)
+				(swap! out (fn [x] (conj x (first (.peekLast window)))))
+			(swap! i inc)
+			)
+		)
+		@out
+	)
+)
+
+
+;Dispatch function
+(defmulti rolling (fn [f c p] f))
+(defmethod rolling :oldmean [f c p] (generic_rolling (fn [a] (/ (reduce + a) (float p))) c p))
+(defmethod rolling :oldmax [f c p]  (generic_rolling (fn [a] (apply max a)) c p))
+(defmethod rolling :oldmin [f c p]  (generic_rolling (fn [a] (apply min a)) c p))
+(defmethod rolling :max [f c p]     (ascending_maxima c p))
+(defmethod rolling :min [f c p]     (ascending_minima c p))
+(defmethod rolling :mean [f c p]    (moving_average c (float p)))
+
