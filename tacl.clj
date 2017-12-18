@@ -2,24 +2,45 @@
   (:gen-class)
   )
 
-;these functions provide technical indicators for price series
+;These functions provide technical indicators for price series
+;They are tested against Python Pandas.
 ;input conventions: c is collection or close, o open l low h high v volume
 ;input conventions: p is period
 
 
-;Simple rolling functions - data will come as nil if not perfectly formed
-;this is not fast enough for long periods
-(defn generic_rolling_fixed_width [fc c p]
-	(lazy-cat
-		(repeat (- p 1) nil)
-		(map fc (partition p 1 c))))
 
-(defn generic_rolling [fc c p]
-	(map fc (partition p 1 c)))
+;Basic point arithmetic
+(defn +s [v1 v2] (map + v1 v2))
+(defn -s [v1 v2] (map - v1 v2))
+(defn *s [v1 v2] (map * v1 v2))
+(defn divssafe [v1 v2] (map (fn [a b] (if (zero? b) nil (/ a b))) v1 v2))
 
 
-;Fast moving average
-(defn moving_average
+;Delta functions
+(defn ds [v] (-s (rest v) (drop-last v)))
+(defn dvv [v] (conj (ds v) nil)) ; append at beginning of sequence
+(defn dss [v] (conj [nil] (ds v))) ; append at beginning of vector
+
+
+;Financial returns
+(defn growth [c] (divssafe (rest c) (drop-last c)))
+(defn returns [c] (map #(- % 1) (growth c)))
+(defn vai [c] (reductions * (growth c)));value added index
+(defn underwater [c] (-s c (reductions max c)))
+(defn maxdrawdown [c] (apply min (underwater c)))
+
+;Basic statistics
+(defn mean [c] (/ (reduce + c) (count c))) 
+(def square #(* % %))
+(defn stdev [c]
+  (let [m (mean c)]
+    (Math/sqrt
+      (/ (reduce #(+ %1 (square (- %2 m))) 0 c)
+         (dec (count c))))))
+(defn sharpe [c] (/ (mean c) (stdev c)))
+
+;Moving averages
+(defn moving_average ;Fast implementation
   "Calculates the moving average of values with the given period.
   Returns a lazy seq, works with infinite input sequences.
   Does not include initial zeros in the output."
@@ -42,54 +63,51 @@
                 (cons 0 values)
                 (drop (dec period) values))))))
 
-
-
-;Exponential moving average
-;python pandas adjust=False. In practice convergence very fast to adjust=True
 (defn ema [c ^double a]
+  "Exponential moving average
+  Matches Python Pandas adjust=False.
+  In practice convergence very fast to adjust=True."
   (let [a' (- 1 a)]
     (reductions
      (fn [ave x]
        (+ (* a (double x)) (* a' (double ave))))
      (first c)
      (rest c))))
-
 (defmulti ewm (fn [f c p] f))
 (defmethod ewm :alpha [f c p] (ema c p))
 (defmethod ewm :com [f c p] (ema c (/ 1 (+ p 1))))
 (defmethod ewm :span [f c p] (ema c (/ 2 (+ p 1))))
 
 
-;Basic point arithmetic
-(defn +s [v1 v2] (map + v1 v2))
-(defn -s [v1 v2] (map - v1 v2))
-(defn *s [v1 v2] (map * v1 v2))
-(defn divssafe [v1 v2] (map (fn [a b] (if (zero? b) nil (/ a b))) v1 v2))
 
-;Delta functions
-(defn ds [v] (-s (rest v) (drop-last v)))
-(defn dvv [v] (conj (ds v) nil)) ; append at beginning of sequence
-(defn dss [v] (conj [nil] (ds v))) ; append at beginning of vector
+;Simple rolling functions - data will come as nil if not perfectly formed
+;this is not fast enough for long periods
+(defn generic_rolling_fixed_width [fc c p]
+  (lazy-cat
+    (repeat (- p 1) nil)
+    (map fc (partition p 1 c))))
 
-;wrong
-; (defn dsn [v n]
-;   (-s (take-last v n) (drop-last v n))
-;   )
+(defn generic_rolling [fc c p] (map fc (partition p 1 c)))
 
 
-;Relative strength index - data will come as nil if not perfectly formed
-;matches talib perfectly. Note definition of alpha matching neither com nor span
 (defn rsi [c p]
+  "Relative strength index.
+  Matches talib perfectly.
+  Data will come as nil if not perfectly formed.
+  Note definition of alpha matching neither com nor span.
+  "
   (let [d (ds c)
         u (map (fn [x] (if (pos? x) x 0)) d)
         d (map (fn [x] (if (neg? x) (- x) 0)) d)
         uede (divssafe (ewm :alpha u (/ 1. p)) (ewm :alpha d (/ 1. p)))]
     (map (fn [x] (if (nil? x) nil (- 100 (/ 100 (+ 1 x))))) uede)))
 
-
 (defn rsi_legacy [c p]
-	;this is the wrong implementation
-	;but it matches what I backtested in Python
+  "Wrong implementation, matches old Python code used for backtesting"
+  (rsi c (/ (+ p 1) 2)))
+
+(defn rsi_legacy_old [c p]
+  "Wrong implementation, matches old Python code used for backtesting"
   (let [d (ds c)
         u (map (fn [x] (if (pos? x) x 0)) d)
         d (map (fn [x] (if (neg? x) (- x) 0)) d)
@@ -107,51 +125,32 @@
                     (lazy-seq (cons nm (f (next sq) nm))))))]
     (f (partition p 1 c) -1000)))
 
-;Fast algorithms
-(defn ascending_minima [c p]
-	(let [window (java.util.ArrayDeque. p) n (count c) out (atom []) i (atom 0)]
-		(while (< @i n)
-			(let [ci (nth c @i)]
-				(while
-					(and
-						(not (zero? (.size window)))
-						(>= (first (.peekFirst window)) ci))
-					(.removeFirst window)
-				)	
-				(.addFirst window [ci @i])
-				(while (<= (last (.peekLast window)) (- @i p))
-					(.removeLast window)
-				)
-				(swap! out (fn [x] (conj x (first (.peekLast window)))))
-			(swap! i inc)
-			)
-		)
-		@out
-	)
+
+(defn ascending_minmax [c p cmp]
+  "Fast implementation using Java Deque"
+  (let [window (java.util.ArrayDeque. p) n (count c) out (atom []) i (atom 0)]
+    (while (< @i n)
+      (let [ci (nth c @i)]
+        (while
+          (and
+            (not (zero? (.size window)))
+            (cmp (first (.peekFirst window)) ci))
+          (.removeFirst window)
+        ) 
+        (.addFirst window [ci @i])
+        (while (<= (last (.peekLast window)) (- @i p))
+          (.removeLast window)
+        )
+        (swap! out (fn [x] (conj x (first (.peekLast window)))))
+      (swap! i inc)
+      )
+    )
+    @out
+  )
 )
 
-(defn ascending_maxima [c p]
-	(let [window (java.util.ArrayDeque. p) n (count c) out (atom []) i (atom 0)]
-		(while (< @i n)
-			(let [ci (nth c @i)]
-				(while
-					(and
-						(not (zero? (.size window)))
-						(<= (first (.peekFirst window)) ci))
-					(.removeFirst window)
-				)	
-				(.addFirst window [ci @i])
-				(while (<= (last (.peekLast window)) (- @i p))
-					(.removeLast window)
-				)
-				(swap! out (fn [x] (conj x (first (.peekLast window)))))
-			(swap! i inc)
-			)
-		)
-		@out
-	)
-)
-
+(defn ascending_maxima [c p] (ascending_minmax c p <=))
+(defn ascending_minima [c p] (ascending_minmax c p >=))
 
 ;Dispatch function
 (defmulti rolling (fn [f c p] f))
