@@ -31,13 +31,27 @@
 
 ;Basic statistics
 (defn mean [c] (/ (reduce + c) (count c))) 
+(defn covariance [c1 c2]
+  (let [m1 (mean c1) m2 (mean c2)]
+    (/
+      (reduce + (map #(* (- %1 m1) (- %2 m2)) c1 c2))
+      (count c1))))
+(defn variance [c] (covariance c c))
+(defn stdevp [c] (Math/sqrt (variance c)))
+(defn stdev [c] (* (Math/sqrt (/ (count c) (dec (count c)))) (stdevp c)))
 (def square #(* % %))
-(defn stdev [c]
-  (let [m (mean c)]
-    (Math/sqrt
-      (/ (reduce #(+ %1 (square (- %2 m))) 0 c)
-         (dec (count c))))))
+;(defn stdev [c]
+;  (let [m (mean c)]
+;    (Math/sqrt
+;      (/ (reduce #(+ %1 (square (- %2 m))) 0 c)
+;         (dec (count c))))))
 (defn sharpe [c] (/ (mean c) (stdev c)))
+(defn sortino [c t]
+  (let [m (- (mean c) t)
+        dstd (Math/sqrt
+              (/  (reduce #(+ %1 (square (min 0 (- %2 t)))) 0 c)
+                  (dec (count c))))]
+    (/ m dstd)))
 
 ;Moving averages
 (defn moving_average ;Fast implementation
