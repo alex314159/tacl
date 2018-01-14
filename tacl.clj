@@ -1,19 +1,17 @@
 (ns tacl.tacl
   (:gen-class)
   )
-
 ;These functions provide technical indicators for price series
 ;They are tested against Python Pandas.
 ;input conventions: c is collection or close, o open l low h high v volume
 ;input conventions: p is period
 
 
-
 ;Basic point arithmetic
 (defn +s [v1 v2] (map + v1 v2))
 (defn -s [v1 v2] (map - v1 v2))
 (defn *s [v1 v2] (map * v1 v2))
-(defn divssafe [v1 v2] (map (fn [a b] (if (zero? b) nil (/ a b))) v1 v2))
+(defn divssafe [v1 v2] (map #(if (zero? %2) nil (/ %1 %2)) v1 v2))
 
 
 ;Delta functions
@@ -54,7 +52,7 @@
     (/ m dstd)))
 
 ;Moving averages
-(defn moving_average ;Fast implementation
+(defn moving-average ;Fast implementation
   "Calculates the moving average of values with the given period.
   Returns a lazy seq, works with infinite input sequences.
   Does not include initial zeros in the output."
@@ -96,12 +94,11 @@
 
 ;Simple rolling functions - data will come as nil if not perfectly formed
 ;this is not fast enough for long periods
-(defn generic_rolling_fixed_width [fc c p]
-  (lazy-cat
-    (repeat (- p 1) nil)
-    (map fc (partition p 1 c))))
+(defn generic-rolling [fc c p] (map fc (partition p 1 c)))
 
-(defn generic_rolling [fc c p] (map fc (partition p 1 c)))
+(defn generic_rolling_fixed_width [fc c p]
+  (lazy-cat (repeat (- p 1) nil) (generic-rolling fc c p)))
+
 
 
 (defn rsi [c p]
@@ -111,12 +108,12 @@
   Note definition of alpha matching neither com nor span.
   "
   (let [d (ds c)
-        u (map (fn [x] (if (pos? x) x 0)) d)
-        d (map (fn [x] (if (neg? x) (- x) 0)) d)
+        u (map #(if (pos? %) % 0) d)
+        d (map #(if (neg? %) (- %) 0) d)
         uede (divssafe (ewm :alpha u (/ 1. p)) (ewm :alpha d (/ 1. p)))]
-    (map (fn [x] (if (nil? x) nil (- 100 (/ 100 (+ 1 x))))) uede)))
+    (map #(if (nil? %) nil (- 100 (/ 100 (+ 1 %)))) uede)))
 
-(defn rsi_legacy [c p]
+(defn rsi-legacy [c p]
   "Wrong implementation, matches old Python code used for backtesting"
   (rsi c (/ (+ p 1) 2)))
 
@@ -132,15 +129,30 @@
 
 ;this will only be faster for (realistic) cases where there are trends
 (defn max2 [c p]
-    (letfn [(f [sq priormax]
-              (if (empty? sq)
-                  ()
-                  (let [w (first sq) lw (last w) nm (if (> lw priormax) lw (apply max w))]
-                    (lazy-seq (cons nm (f (next sq) nm))))))]
-    (f (partition p 1 c) -1000)))
+  (letfn [(f [sq priormax]
+            (if (empty? sq)
+                ()
+                (let [w (first sq) lw (last w) nm (if (> lw priormax) lw (apply max w))]
+                  (lazy-seq (cons nm (f (next sq) nm))))))]
+  (f (partition p 1 c) -1000)))
 
 
-(defn ascending_minmax [c p cmp]
+(defn ascending-minmax [c p cmp]
+  "Fast implementation using Java Deque"
+  (let [window (java.util.ArrayDeque. p) n (count c) out (atom []) i (atom 0)]
+    (while (< @i n)
+      (let [ci (nth c @i)]
+        (while (and (pos? (.size window)) (cmp (first (.peekFirst window)) ci))
+          (.removeFirst window)) 
+        (.addFirst window [ci @i])
+        (while (<= (last (.peekLast window)) (- @i p))
+          (.removeLast window))
+        (swap! out (fn [x] (conj x (first (.peekLast window)))))
+        (swap! i inc)))
+    @out)
+)
+
+(defn ascending_minmax-old [c p cmp]
   "Fast implementation using Java Deque"
   (let [window (java.util.ArrayDeque. p) n (count c) out (atom []) i (atom 0)]
     (while (< @i n)
@@ -162,16 +174,15 @@
     @out
   )
 )
-
-(defn ascending_maxima [c p] (ascending_minmax c p <=))
-(defn ascending_minima [c p] (ascending_minmax c p >=))
+(defn ascending-maxima [c p] (ascending-minmax c p <=))
+(defn ascending-minima [c p] (ascending-minmax c p >=))
 
 ;Dispatch function
 (defmulti rolling (fn [f c p] f))
-(defmethod rolling :oldmean [f c p] (generic_rolling (fn [a] (/ (reduce + a) (float p))) c p))
-(defmethod rolling :oldmax [f c p]  (generic_rolling (fn [a] (apply max a)) c p))
-(defmethod rolling :oldmin [f c p]  (generic_rolling (fn [a] (apply min a)) c p))
-(defmethod rolling :max [f c p]     (ascending_maxima c p))
-(defmethod rolling :min [f c p]     (ascending_minima c p))
-(defmethod rolling :mean [f c p]    (moving_average c (float p)))
+(defmethod rolling :slow-mean [f c p] (generic-rolling (fn [a] (/ (reduce + a) (float p))) c p))
+(defmethod rolling :slow-max [f c p]  (generic-rolling (fn [a] (apply max a)) c p))
+(defmethod rolling :slow-min [f c p]  (generic-rolling (fn [a] (apply min a)) c p))
+(defmethod rolling :max [f c p]     (ascending-minmax c p <=))
+(defmethod rolling :min [f c p]     (ascending-minmax c p >=))
+(defmethod rolling :mean [f c p]    (moving-average c (float p)))
 
