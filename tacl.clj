@@ -19,13 +19,32 @@
 (defn dvv [v] (conj (ds v) nil)) ; append at beginning of sequence
 (defn dss [v] (conj [nil] (ds v))) ; append at beginning of vector
 
+;Filling data forward
+(defn ffill [v]
+  (letfn [(f [yday tday] (if (nil? tday) yday tday))
+          (g [coll tday] (conj coll (f (peek coll) tday)))]
+    (reduce g [(first v)] (rest v))))
+
+(defn vec-to-map [v k] (into {} (for [r v] {(k r) r})))
+
+;(defn align-vectors [v1 v2 key1 key2]
+;  (let [v2map (vec-to-map v2 key2)]
+;    (into [] (for [r v1]
+;      (let [row (v2map (key1 r))]
+;        (if (nil? row) {key1 (key1 r)} row))))))
+
+(defn align-vectors [v1 v2 key1 key2]
+  (let [v2map (vec-to-map v2 key2)]
+    (into [] (for [r v1] (if-let [row (v2map (key1 r))] row {key1 (key1 r)})))))
+
 
 ;Financial returns
 (defn growth [c] (divssafe (rest c) (drop-last c)))
-(defn returns [c] (map #(- % 1) (growth c)))
+(defn returns [c] (map #(- (double %) 1) (growth c)))
 (defn vai [c] (reductions * (growth c)));value added index
 (defn underwater [c] (-s c (reductions max c)))
 (defn maxdrawdown [c] (apply min (underwater c)))
+(defn maxdrawdownpc [c] (let [max2here (reductions max c)] (apply min (divssafe (-s c max2here) max2here))))
 
 ;Basic statistics
 (defn mean [c] (/ (reduce + c) (count c))) 
@@ -36,6 +55,7 @@
       (count c1))))
 (defn variance [c] (covariance c c))
 (defn stdevp [c] (Math/sqrt (variance c)))
+(defn correlation [c1 c2] (/ (covariance c1 c2) (* (stdevp c1) (stdevp c2))))
 (defn stdev [c] (* (Math/sqrt (/ (count c) (dec (count c)))) (stdevp c)))
 (def square #(* % %))
 ;(defn stdev [c]
@@ -51,7 +71,11 @@
                   (dec (count c))))]
     (/ m dstd)))
 
-;Moving averages
+
+;;;;;;;;;;;;;;;;;
+;MOVING AVERAGES;
+;;;;;;;;;;;;;;;;;
+
 (defn moving-average ;Fast implementation
   "Calculates the moving average of values with the given period.
   Returns a lazy seq, works with infinite input sequences.
@@ -90,17 +114,6 @@
 (defmethod ewm :com [f c p] (ema c (/ 1 (+ p 1))))
 (defmethod ewm :span [f c p] (ema c (/ 2 (+ p 1))))
 
-
-
-;Simple rolling functions - data will come as nil if not perfectly formed
-;this is not fast enough for long periods
-(defn generic-rolling [fc c p] (map fc (partition p 1 c)))
-
-(defn generic_rolling_fixed_width [fc c p]
-  (lazy-cat (repeat (- p 1) nil) (generic-rolling fc c p)))
-
-
-
 (defn rsi [c p]
   "Relative strength index.
   Matches talib perfectly.
@@ -117,29 +130,11 @@
   "Wrong implementation, matches old Python code used for backtesting"
   (rsi c (/ (+ p 1) 2)))
 
-(defn rsi_legacy_old [c p]
-  "Wrong implementation, matches old Python code used for backtesting"
-  (let [d (ds c)
-        u (map (fn [x] (if (pos? x) x 0)) d)
-        d (map (fn [x] (if (neg? x) (- x) 0)) d)
-        uede (divssafe (ewm :span u p) (ewm :span d p))]
-    (map (fn [x] (if (nil? x) nil (- 100 (/ 100 (+ 1 x))))) uede)))
-
 ;;;;;;;;;;;;;;;;
-
-;this will only be faster for (realistic) cases where there are trends
-(defn max2 [c p]
-  (letfn [(f [sq priormax]
-            (if (empty? sq)
-                ()
-                (let [w (first sq) lw (last w) nm (if (> lw priormax) lw (apply max w))]
-                  (lazy-seq (cons nm (f (next sq) nm))))))]
-  (f (partition p 1 c) -1000)))
-
 
 (defn ascending-minmax [c p cmp]
   "Fast implementation using Java Deque"
-  (let [window (java.util.ArrayDeque. p) n (count c) out (atom []) i (atom 0)]
+  (let [window (ArrayDeque. p) n (count c) out (atom []) i (atom 0)]
     (while (< @i n)
       (let [ci (nth c @i)]
         (while (and (pos? (.size window)) (cmp (first (.peekFirst window)) ci))
@@ -152,32 +147,34 @@
     @out)
 )
 
-(defn ascending_minmax-old [c p cmp]
-  "Fast implementation using Java Deque"
-  (let [window (java.util.ArrayDeque. p) n (count c) out (atom []) i (atom 0)]
-    (while (< @i n)
-      (let [ci (nth c @i)]
-        (while
-          (and
-            (not (zero? (.size window)))
-            (cmp (first (.peekFirst window)) ci))
-          (.removeFirst window)
-        ) 
-        (.addFirst window [ci @i])
-        (while (<= (last (.peekLast window)) (- @i p))
-          (.removeLast window)
-        )
-        (swap! out (fn [x] (conj x (first (.peekLast window)))))
-      (swap! i inc)
-      )
-    )
-    @out
-  )
-)
-(defn ascending-maxima [c p] (ascending-minmax c p <=))
-(defn ascending-minima [c p] (ascending-minmax c p >=))
+;(defn ascending-maxima [c p] (ascending-minmax c p <=))
+;(defn ascending-minima [c p] (ascending-minmax c p >=))
 
-;Dispatch function
+;;;;;;;;;;;;;;
+;UNUSED BELOW;
+;;;;;;;;;;;;;;
+
+;Simple rolling functions - data will come as nil if not perfectly formed
+;this is not fast enough for long periods
+(defn generic-rolling [fc c p] (map fc (partition p 1 c)))
+
+(defn generic_rolling_fixed_width [fc c p]
+  (lazy-cat (repeat (- p 1) nil) (generic-rolling fc c p)))
+
+;this will only be faster for (realistic) cases where there are trends
+(defn max-with-trends [c p]
+  (letfn [(f [sq priormax]
+            (if (empty? sq)
+              ()
+              (let [w (first sq) lw (last w) nm (if (> lw priormax) lw (apply max w))]
+                (lazy-seq (cons nm (f (next sq) nm))))))]
+    (f (partition p 1 c) -1000)))
+
+
+;;;;;;;;;;;;;;;;;;;
+;DISPATCH FUNCTION;
+;;;;;;;;;;;;;;;;;;;
+
 (defmulti rolling (fn [f c p] f))
 (defmethod rolling :slow-mean [f c p] (generic-rolling (fn [a] (/ (reduce + a) (float p))) c p))
 (defmethod rolling :slow-max [f c p]  (generic-rolling (fn [a] (apply max a)) c p))
